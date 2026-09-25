@@ -21,13 +21,36 @@ def _validate_consent(actor, data, lookup):
         raise ValidationError("consent scope is required")
 
 
+def _validate_consent_activate(actor, entity, data, lookup):
+    participant_id = entity["data"].get("participant_id")
+    withdrawals = lookup("withdrawal", "participant_id", participant_id) if lookup else []
+    blockers = [
+        item for item in (withdrawals or [])
+        if item["status"] in PENDING_WITHDRAWAL_STATUSES
+    ]
+    if blockers:
+        raise ConflictError(
+            "participant %s has a pending or approved withdrawal" % participant_id
+        )
+
+
 def _validate_sample_store(actor, entity, data, lookup):
     consent = _find_one(lookup, "consent", "id", data.get("consent_id"))
     if not consent or consent["status"] != "active":
         raise ValidationError("storage requires active consent")
-    if "research" not in consent["data"].get("scope", []):
-        raise ValidationError("consent does not include research use")
+    purpose = data.get("purpose")
+    if purpose not in consent["data"].get("scope", []):
+        raise ValidationError("consent scope does not cover purpose: " + str(purpose))
     return {"stored_at": "2026-09-24T00:00:00Z"}
+
+
+def _validate_sample_loan(actor, entity, data, lookup):
+    consent = _find_one(lookup, "consent", "id", entity["data"].get("consent_id"))
+    if not consent or consent["status"] != "active":
+        raise ValidationError("loan requires active consent")
+    purpose = entity["data"].get("purpose")
+    if purpose and purpose not in consent["data"].get("scope", []):
+        raise ValidationError("consent scope does not cover purpose: " + str(purpose))
 
 
 def _validate_withdrawal_approve(actor, entity, data, lookup):
@@ -41,7 +64,14 @@ def _validate_withdrawal_approve(actor, entity, data, lookup):
 
 
 CUSTOM_CREATE = {'participant': _validate_participant, 'consent': _validate_consent}
-CUSTOM_TRANSITIONS = {('sample', 'store'): _validate_sample_store, ('withdrawal', 'approve'): _validate_withdrawal_approve}
+CUSTOM_TRANSITIONS = {('consent', 'activate'): _validate_consent_activate, ('sample', 'store'): _validate_sample_store, ('sample', 'loan'): _validate_sample_loan, ('withdrawal', 'approve'): _validate_withdrawal_approve}
+
+# Samples in these statuses are final and never rebound on consent activation.
+TERMINAL_SAMPLE_STATUSES = ("anonymized", "destroyed")
+# Non-terminal samples still linked to a consent version get rebound or suspended.
+REBINDABLE_SAMPLE_STATUSES = ("stored", "on_loan", "suspended")
+# Withdrawals in these statuses block activation of a new consent version.
+PENDING_WITHDRAWAL_STATUSES = ("requested", "approved")
 
 
 class RuleEngine:
@@ -49,7 +79,7 @@ class RuleEngine:
     INITIAL_STATUS = {'participant': 'registered', 'consent': 'draft', 'sample': 'collected', 'withdrawal': 'requested'}
     TRANSITIONS = {'participant': {'close_participant': (('registered',), 'closed')}, 'consent': {'activate': (('draft',), 'active'), 'supersede': (('active',), 'superseded'), 'withdraw': (('active',), 'withdrawn')}, 'sample': {'store': (('collected',), 'stored'), 'loan': (('stored',), 'on_loan'), 'return': (('on_loan',), 'stored'), 'anonymize': (('stored',), 'anonymized'), 'destroy': (('stored',), 'destroyed')}, 'withdrawal': {'approve': (('requested',), 'approved'), 'execute': (('approved',), 'executed')}}
     CREATE_REQUIRED = {'participant': ('name',), 'consent': ('participant_id', 'scope'), 'sample': ('participant_id', 'sample_code', 'collected_at'), 'withdrawal': ('participant_id', 'requested_at')}
-    ACTION_REQUIRED = {('consent', 'activate'): ('scope', 'version', 'expires_at'), ('consent', 'supersede'): ('reason',), ('consent', 'withdraw'): ('reason',), ('sample', 'store'): ('freezer', 'position', 'consent_id'), ('sample', 'loan'): ('recipient', 'purpose', 'due_at'), ('sample', 'anonymize'): ('reason',), ('sample', 'destroy'): ('reason',), ('withdrawal', 'approve'): ('reason', 'sample_ids'), ('withdrawal', 'execute'): ('executed_at',)}
+    ACTION_REQUIRED = {('consent', 'activate'): ('scope', 'version', 'expires_at'), ('consent', 'supersede'): ('reason',), ('consent', 'withdraw'): ('reason',), ('sample', 'store'): ('freezer', 'position', 'consent_id', 'purpose'), ('sample', 'loan'): ('recipient', 'purpose', 'due_at'), ('sample', 'anonymize'): ('reason',), ('sample', 'destroy'): ('reason',), ('withdrawal', 'approve'): ('reason', 'sample_ids'), ('withdrawal', 'execute'): ('executed_at',)}
     CREATE_ROLES = {'participant': ('admin', 'biobank'), 'consent': ('admin', 'committee'), 'sample': ('admin', 'biobank'), 'withdrawal': ('admin', 'biobank')}
     ROLE_ACTIONS = {'close_participant': ('admin', 'biobank'), 'activate': ('admin', 'committee'), 'supersede': ('admin', 'committee'), 'withdraw': ('admin', 'committee'), 'store': ('admin', 'biobank'), 'loan': ('admin', 'biobank'), 'return': ('admin', 'biobank'), 'anonymize': ('admin', 'biobank'), 'destroy': ('admin', 'biobank'), 'approve': ('admin', 'committee'), 'execute': ('admin', 'biobank')}
 
@@ -106,6 +136,39 @@ class RuleEngine:
         if extra:
             patch.update(extra)
         return next_status, patch
+
+    @staticmethod
+    def plan_consent_activation(consent, activate_data, lookup):
+        """Compute the side effects of activating a draft consent version.
+
+        Pure rule calculation with no storage side effects: the old active
+        versions of the same participant are superseded, and their non-terminal
+        samples are either rebound to the new version (purpose still covered by
+        the new scope) or suspended (purpose no longer covered). The service
+        layer applies the returned plan in a single transaction.
+        """
+        participant_id = consent["data"].get("participant_id")
+        new_scope = activate_data.get("scope") or []
+        superseded = [
+            item
+            for item in (lookup("consent", "participant_id", participant_id) or [])
+            if item["id"] != consent["id"] and item["status"] == "active"
+        ]
+        old_ids = {item["id"] for item in superseded}
+        rebind = []
+        suspend = []
+        if old_ids:
+            samples = lookup("sample", "participant_id", participant_id) or []
+            for sample in samples:
+                if sample["status"] not in REBINDABLE_SAMPLE_STATUSES:
+                    continue
+                if sample["data"].get("consent_id") not in old_ids:
+                    continue
+                if sample["data"].get("purpose") in new_scope:
+                    rebind.append(sample)
+                else:
+                    suspend.append(sample)
+        return {"superseded": superseded, "rebind": rebind, "suspend": suspend}
 
 
 def _find_one(lookup, kind, field, value):

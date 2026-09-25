@@ -157,6 +157,61 @@ class SQLiteRepository:
                 ),
             )
 
+    def apply_changes(self, entity_updates, audit_entries):
+        """Apply entity updates and audit entries in one transaction.
+
+        Each update is a dict with id, status, data and optional
+        expected_version; each audit entry mirrors append_audit fields.
+        Any failure rolls everything back, so callers never persist half
+        of a multi-entity change.
+        """
+        now = utcnow()
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            for update in entity_updates:
+                row = connection.execute(
+                    "SELECT version FROM entities WHERE id = ?", (update["id"],)
+                ).fetchone()
+                if not row:
+                    raise NotFoundError("entity not found: " + update["id"])
+                current_version = int(row["version"])
+                expected = update.get("expected_version")
+                if expected is not None and current_version != int(expected):
+                    raise ConflictError(
+                        "version conflict: expected %s, found %s"
+                        % (expected, current_version)
+                    )
+                payload = json.dumps(update["data"], ensure_ascii=False, sort_keys=True)
+                cursor = connection.execute(
+                    "UPDATE entities SET status = ?, version = version + 1, data = ?, updated_at = ? "
+                    "WHERE id = ? AND version = ?",
+                    (update["status"], payload, now, update["id"], current_version),
+                )
+                if cursor.rowcount != 1:
+                    raise ConflictError("concurrent update on entity: " + update["id"])
+            for entry in audit_entries:
+                connection.execute(
+                    "INSERT INTO audit_log(entity_id, actor_id, actor_role, action, from_status, to_status, detail, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        entry["entity_id"],
+                        entry["actor_id"],
+                        entry["actor_role"],
+                        entry["action"],
+                        entry["from_status"],
+                        entry["to_status"],
+                        json.dumps(entry["detail"], ensure_ascii=False, sort_keys=True),
+                        now,
+                    ),
+                )
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
     def list_audit(self, entity_id=None):
         with self._connect() as connection:
             if entity_id:
