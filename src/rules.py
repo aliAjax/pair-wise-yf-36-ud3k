@@ -25,9 +25,23 @@ def _validate_sample_store(actor, entity, data, lookup):
     consent = _find_one(lookup, "consent", "id", data.get("consent_id"))
     if not consent or consent["status"] != "active":
         raise ValidationError("storage requires active consent")
-    if "research" not in consent["data"].get("scope", []):
-        raise ValidationError("consent does not include research use")
-    return {"stored_at": "2026-09-24T00:00:00Z"}
+    purpose = data.get("purpose")
+    if purpose not in consent["data"].get("scope", []):
+        raise ValidationError("consent scope does not cover purpose: " + str(purpose))
+    return {"stored_at": "2026-09-24T00:00:00Z", "use": purpose}
+
+
+def _validate_consent_activate(actor, entity, data, lookup):
+    participant_id = entity["data"].get("participant_id")
+    if not participant_id or lookup is None:
+        return
+    withdrawals = lookup("withdrawal", "participant_id", participant_id) or []
+    for withdrawal in withdrawals:
+        if withdrawal["status"] in RuleEngine.BLOCKING_WITHDRAWAL_STATUS:
+            raise ConflictError(
+                "participant has a %s withdrawal: %s"
+                % (withdrawal["status"], withdrawal["id"])
+            )
 
 
 def _validate_withdrawal_approve(actor, entity, data, lookup):
@@ -41,15 +55,17 @@ def _validate_withdrawal_approve(actor, entity, data, lookup):
 
 
 CUSTOM_CREATE = {'participant': _validate_participant, 'consent': _validate_consent}
-CUSTOM_TRANSITIONS = {('sample', 'store'): _validate_sample_store, ('withdrawal', 'approve'): _validate_withdrawal_approve}
+CUSTOM_TRANSITIONS = {('sample', 'store'): _validate_sample_store, ('withdrawal', 'approve'): _validate_withdrawal_approve, ('consent', 'activate'): _validate_consent_activate}
 
 
 class RuleEngine:
+    TERMINAL_SAMPLE_STATUS = ('anonymized', 'destroyed')
+    BLOCKING_WITHDRAWAL_STATUS = ('requested', 'approved')
     ALIASES = {'participants': 'participant', 'consents': 'consent', 'samples': 'sample', 'withdrawals': 'withdrawal'}
     INITIAL_STATUS = {'participant': 'registered', 'consent': 'draft', 'sample': 'collected', 'withdrawal': 'requested'}
     TRANSITIONS = {'participant': {'close_participant': (('registered',), 'closed')}, 'consent': {'activate': (('draft',), 'active'), 'supersede': (('active',), 'superseded'), 'withdraw': (('active',), 'withdrawn')}, 'sample': {'store': (('collected',), 'stored'), 'loan': (('stored',), 'on_loan'), 'return': (('on_loan',), 'stored'), 'anonymize': (('stored',), 'anonymized'), 'destroy': (('stored',), 'destroyed')}, 'withdrawal': {'approve': (('requested',), 'approved'), 'execute': (('approved',), 'executed')}}
     CREATE_REQUIRED = {'participant': ('name',), 'consent': ('participant_id', 'scope'), 'sample': ('participant_id', 'sample_code', 'collected_at'), 'withdrawal': ('participant_id', 'requested_at')}
-    ACTION_REQUIRED = {('consent', 'activate'): ('scope', 'version', 'expires_at'), ('consent', 'supersede'): ('reason',), ('consent', 'withdraw'): ('reason',), ('sample', 'store'): ('freezer', 'position', 'consent_id'), ('sample', 'loan'): ('recipient', 'purpose', 'due_at'), ('sample', 'anonymize'): ('reason',), ('sample', 'destroy'): ('reason',), ('withdrawal', 'approve'): ('reason', 'sample_ids'), ('withdrawal', 'execute'): ('executed_at',)}
+    ACTION_REQUIRED = {('consent', 'activate'): ('scope', 'version', 'expires_at'), ('consent', 'supersede'): ('reason',), ('consent', 'withdraw'): ('reason',), ('sample', 'store'): ('freezer', 'position', 'consent_id', 'purpose'), ('sample', 'loan'): ('recipient', 'purpose', 'due_at'), ('sample', 'anonymize'): ('reason',), ('sample', 'destroy'): ('reason',), ('withdrawal', 'approve'): ('reason', 'sample_ids'), ('withdrawal', 'execute'): ('executed_at',)}
     CREATE_ROLES = {'participant': ('admin', 'biobank'), 'consent': ('admin', 'committee'), 'sample': ('admin', 'biobank'), 'withdrawal': ('admin', 'biobank')}
     ROLE_ACTIONS = {'close_participant': ('admin', 'biobank'), 'activate': ('admin', 'committee'), 'supersede': ('admin', 'committee'), 'withdraw': ('admin', 'committee'), 'store': ('admin', 'biobank'), 'loan': ('admin', 'biobank'), 'return': ('admin', 'biobank'), 'anonymize': ('admin', 'biobank'), 'destroy': ('admin', 'biobank'), 'approve': ('admin', 'committee'), 'execute': ('admin', 'biobank')}
 

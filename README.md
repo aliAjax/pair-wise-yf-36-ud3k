@@ -26,6 +26,14 @@ python3 app.py --db ./data.db --port 8302
 
 - `participant`：参与者；`consent`：同意版本；`sample`：样本；`withdrawal`：撤回申请。
 
+## 同意版本更替
+
+- 样本入库（`store`）时必须登记用途`purpose`，且用途须落在所绑同意版本的`scope`内；登记后保存为样本的`use`字段。
+- 草稿版同意激活（`activate`）时，同一参与者的旧 active 版本自动变为`superseded`，绑定旧版且未终结（未`anonymized`/`destroyed`）的样本改绑到新版。
+- 新版`scope`未覆盖某条样本登记用途的，该样本转为`suspended`继续停用（不可借出），并列入激活结果的`activation.suspended_samples`；结果同时给出`superseded_consent_ids`和`rebound_sample_ids`。
+- 参与者存在`requested`或`approved`状态的撤回申请时，新版本拒绝激活。
+- 版本更替、样本改绑/停用和审计写入在同一事务内完成，任一步失败整体回滚，不留半套结果。
+
 ## 主要接口
 
 - `GET /health`：健康检查。
